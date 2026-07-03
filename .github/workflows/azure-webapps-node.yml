@@ -1,21 +1,11 @@
-# This workflow will build and push a node.js application to an Azure Web App when a commit is pushed to your default branch.
-#
-# This workflow assumes you have already created the target Azure App Service web app.
-# For instructions see https://docs.microsoft.com/en-us/azure/app-service/quickstart-nodejs?tabs=linux&pivots=development-environment-cli
-#
-# To configure this workflow:
-#
-# 1. Download the Publish Profile for your Azure Web App. You can download this file from the Overview page of your Web App in the Azure Portal.
-#    For more information: https://docs.microsoft.com/en-us/azure/app-service/deploy-github-actions?tabs=applevel#generate-deployment-credentials
-#
-# 2. Create a secret in your repository named AZURE_WEBAPP_PUBLISH_PROFILE, paste the publish profile contents as the value of the secret.
-#    For instructions on obtaining the publish profile see: https://docs.microsoft.com/azure/app-service/deploy-github-actions#configure-the-github-secret
-#
-# 3. Change the value for the AZURE_WEBAPP_NAME. Optionally, change the AZURE_WEBAPP_PACKAGE_PATH and NODE_VERSION environment variables below.
-#
-# For more information on GitHub Actions for Azure: https://github.com/Azure/Actions
-# For more information on the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# For more samples to get started with GitHub Action workflows to deploy to Azure: https://github.com/Azure/actions-workflow-samples
+# This workflow builds and deploys a Node.js app to Azure Web Apps when a commit is pushed to the default branch.
+# It's been hardened to:
+# - Use Node 18.x
+# - Detect package.json and only run npm/yarn steps when present
+# - Avoid relying on an npm cache when a lockfile is missing
+# - Allow deploying a package in a subfolder via AZURE_WEBAPP_PACKAGE_PATH
+
+name: Azure Webapps Node CI/CD
 
 on:
   push:
@@ -25,7 +15,7 @@ on:
 env:
   AZURE_WEBAPP_NAME: your-app-name    # set this to your application's name
   AZURE_WEBAPP_PACKAGE_PATH: '.'      # set this to the path to your web app project, defaults to the repository root
-  NODE_VERSION: '14.x'                # set this to the node version to use
+  NODE_VERSION: '18.x'                # upgraded to current LTS
 
 permissions:
   contents: read
@@ -40,19 +30,51 @@ jobs:
       uses: actions/setup-node@v3
       with:
         node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
+
+    - name: Check for package.json and lockfile
+      id: pkg_check
+      run: |
+        PKG_PATH="${{ env.AZURE_WEBAPP_PACKAGE_PATH }}"
+        if [ -f "$PKG_PATH/package.json" ]; then
+          echo "present=true" >> $GITHUB_OUTPUT
+        else
+          echo "present=false" >> $GITHUB_OUTPUT
+        fi
+        if [ -f "$PKG_PATH/package-lock.json" ] || [ -f "$PKG_PATH/npm-shrinkwrap.json" ] || [ -f "$PKG_PATH/yarn.lock" ]; then
+          echo "has_lock=true" >> $GITHUB_OUTPUT
+        else
+          echo "has_lock=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Install dependencies
+      if: steps.pkg_check.outputs.present == 'true'
+      run: |
+        cd "${{ env.AZURE_WEBAPP_PACKAGE_PATH }}"
+        if [ "${{ steps.pkg_check.outputs.has_lock }}" = "true" ]; then
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f yarn.lock ]; then
+            yarn install
+          else
+            npm install
+          fi
+        else
+          npm install
+        fi
 
     - name: npm install, build, and test
+      if: steps.pkg_check.outputs.present == 'true'
       run: |
-        npm install
+        cd "${{ env.AZURE_WEBAPP_PACKAGE_PATH }}"
         npm run build --if-present
         npm run test --if-present
 
     - name: Upload artifact for deployment job
+      if: steps.pkg_check.outputs.present == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: node-app
-        path: .
+        path: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
 
   deploy:
     permissions:
