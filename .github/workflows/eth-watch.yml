@@ -1,0 +1,225 @@
+name: ETH & LP Monitor
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # every 15 minutes
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq bc
+
+      - name: Fetch balances and recent tx
+        env:
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+          WATCH_ADDRESS: ${{ secrets.WATCH_ADDRESS }}
+          PAIR_CONTRACT: ${{ secrets.PAIR_CONTRACT }}
+          TOKEN_CONTRACT: ${{ secrets.TOKEN_CONTRACT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ETHERSCAN_API_KEY:-}" ]; then
+            echo "ERROR: ETHERSCAN_API_KEY is not set as a secret."
+            exit 1
+          fi
+          if [ -z "${WATCH_ADDRESS:-}" ]; then
+            echo "ERROR: WATCH_ADDRESS is not set as a secret."
+            exit 1
+          fi
+
+          # Normalize address to lowercase for comparisons
+          WATCH_ADDR_LOWER=$(echo "$WATCH_ADDRESS" | tr '[:upper:]' '[:lower:]')
+
+          # Fetch ETH balance (wei)
+          raw_eth=$(curl -s "https://api.etherscan.io/api?module=account&action=balance&address=${WATCH_ADDRESS}&tag=latest&apikey=${ETHERSCAN_API_KEY}")
+          eth_wei=$(echo "$raw_eth" | jq -r .result)
+          eth_balance=$(echo "scale=18; ${eth_wei:-0}/1000000000000000000" | bc -l)
+          echo "ETH_WEI=$eth_wei" >> $GITHUB_ENV
+          echo "ETH_BALANCE=$eth_balance" >> $GITHUB_ENV
+          echo "Current ETH: $eth_balance"
+
+          # Fetch LP token balance (pair contract)
+          if [ -n "${PAIR_CONTRACT:-}" ]; then
+            raw_lp=$(curl -s "https://api.etherscan.io/api?module=account&action=tokenbalance&contractaddress=${PAIR_CONTRACT}&address=${WATCH_ADDRESS}&tag=latest&apikey=${ETHERSCAN_API_KEY}")
+            lp_balance_raw=$(echo "$raw_lp" | jq -r .result)
+            # Note: LP token decimals vary; store raw value
+            echo "LP_BALANCE_RAW=$lp_balance_raw" >> $GITHUB_ENV
+            echo "LP_BALANCE_DISPLAY=$lp_balance_raw" >> $GITHUB_ENV
+            echo "Current LP (raw): $lp_balance_raw"
+          else
+            echo "PAIR_CONTRACT not set; skipping LP balance check"
+            echo "LP_BALANCE_RAW=0" >> $GITHUB_ENV
+            echo "LP_BALANCE_DISPLAY=0" >> $GITHUB_ENV
+          fi
+
+          # Fetch token balance (optional)
+          if [ -n "${TOKEN_CONTRACT:-}" ]; then
+            raw_tok=$(curl -s "https://api.etherscan.io/api?module=account&action=tokenbalance&contractaddress=${TOKEN_CONTRACT}&address=${WATCH_ADDRESS}&tag=latest&apikey=${ETHERSCAN_API_KEY}")
+            tok_balance_raw=$(echo "$raw_tok" | jq -r .result)
+            echo "TOKEN_BALANCE_RAW=$tok_balance_raw" >> $GITHUB_ENV
+            echo "TOKEN_BALANCE_DISPLAY=$tok_balance_raw" >> $GITHUB_ENV
+            echo "Current token (raw): $tok_balance_raw"
+          else
+            echo "TOKEN_CONTRACT not set; skipping token balance check"
+            echo "TOKEN_BALANCE_RAW=0" >> $GITHUB_ENV
+            echo "TOKEN_BALANCE_DISPLAY=0" >> $GITHUB_ENV
+          fi
+
+          # Fetch recent txs (most recent 10)
+          raw_txs=$(curl -s "https://api.etherscan.io/api?module=account&action=txlist&address=${WATCH_ADDRESS}&startblock=0&endblock=99999999&page=1&offset=10&sort=desc&apikey=${ETHERSCAN_API_KEY}")
+          echo "$raw_txs" > /tmp/txs.json
+          tx_count=$(jq -r '.result | length' /tmp/txs.json)
+          echo "TX_COUNT=$tx_count" >> $GITHUB_ENV
+          if [ "$tx_count" -gt 0 ]; then
+            latest_tx_hash=$(jq -r '.result[0].hash' /tmp/txs.json)
+            latest_tx_from=$(jq -r '.result[0].from' /tmp/txs.json | tr '[:upper:]' '[:lower:]')
+            latest_tx_to=$(jq -r '.result[0].to' /tmp/txs.json | tr '[:upper:]' '[:lower:]')
+            latest_tx_value=$(jq -r '.result[0].value' /tmp/txs.json)
+            latest_tx_isError=$(jq -r '.result[0].isError' /tmp/txs.json)
+            echo "LATEST_TX_HASH=$latest_tx_hash" >> $GITHUB_ENV
+            echo "LATEST_TX_FROM=$latest_tx_from" >> $GITHUB_ENV
+            echo "LATEST_TX_TO=$latest_tx_to" >> $GITHUB_ENV
+            echo "LATEST_TX_VALUE=$latest_tx_value" >> $GITHUB_ENV
+            echo "LATEST_TX_ISERROR=$latest_tx_isError" >> $GITHUB_ENV
+          else
+            echo "LATEST_TX_HASH=" >> $GITHUB_ENV
+          fi
+
+      - name: Load last-known state
+        id: loadlast
+        run: |
+          mkdir -p .github/eth-watch
+          LAST_ETH_FILE=.github/eth-watch/last_eth_wei.txt
+          LAST_LP_FILE=.github/eth-watch/last_lp_raw.txt
+          LAST_TOKEN_FILE=.github/eth-watch/last_token_raw.txt
+          LAST_TX_FILE=.github/eth-watch/last_tx_hash.txt
+
+          if [ -f "$LAST_ETH_FILE" ]; then last_eth=$(cat "$LAST_ETH_FILE"); else last_eth=0; fi
+          if [ -f "$LAST_LP_FILE" ]; then last_lp=$(cat "$LAST_LP_FILE"); else last_lp=0; fi
+          if [ -f "$LAST_TOKEN_FILE" ]; then last_token=$(cat "$LAST_TOKEN_FILE"); else last_token=0; fi
+          if [ -f "$LAST_TX_FILE" ]; then last_tx=$(cat "$LAST_TX_FILE"); else last_tx=""; fi
+
+          echo "last_eth=$last_eth" >> $GITHUB_OUTPUT
+          echo "last_lp=$last_lp" >> $GITHUB_OUTPUT
+          echo "last_token=$last_token" >> $GITHUB_OUTPUT
+          echo "last_tx=$last_tx" >> $GITHUB_OUTPUT
+
+      - name: Compare and create alert if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WATCH_ADDRESS: ${{ secrets.WATCH_ADDRESS }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          addr_lower=$(echo "$WATCH_ADDRESS" | tr '[:upper:]' '[:lower:]')
+
+          changed=0
+          issue_title=""
+          issue_body=""
+
+          # Compare ETH
+          current_eth_wei=${ETH_WEI:-0}
+          last_eth_wei=${{ steps.loadlast.outputs.last_eth }}
+          if [ "$current_eth_wei" != "$last_eth_wei" ]; then
+            changed=1
+            issue_title+="Balance change for ${addr_lower} - ETH\n"
+            last_eth_eth=$(echo "scale=18; $last_eth_wei/1000000000000000000" | bc -l)
+            curr_eth_eth=$(echo "scale=18; $current_eth_wei/1000000000000000000" | bc -l)
+            issue_body+="ETH balance changed from ${last_eth_eth} to ${curr_eth_eth} ETH.\n"
+          fi
+
+          # Compare LP raw
+          current_lp_raw=${LP_BALANCE_RAW:-0}
+          last_lp_raw=${{ steps.loadlast.outputs.last_lp }}
+          if [ "$current_lp_raw" != "$last_lp_raw" ]; then
+            changed=1
+            issue_title+="LP token balance changed for ${addr_lower}\n"
+            issue_body+="LP token raw balance changed from ${last_lp_raw} to ${current_lp_raw}.\n"
+          fi
+
+          # Compare token raw (if set)
+          current_token_raw=${TOKEN_BALANCE_RAW:-0}
+          last_token_raw=${{ steps.loadlast.outputs.last_token }}
+          if [ "$current_token_raw" != "$last_token_raw" ] && [ -n "${TOKEN_CONTRACT:-}" ]; then
+            changed=1
+            issue_title+="ERC-20 token balance changed for ${addr_lower}\n"
+            issue_body+="Token raw balance changed from ${last_token_raw} to ${current_token_raw}.\n"
+          fi
+
+          # Check for new outgoing tx
+          latest_tx_hash=${LATEST_TX_HASH:-}
+          latest_tx_from=${LATEST_TX_FROM:-}
+          last_known_tx=${{ steps.loadlast.outputs.last_tx }}
+          if [ -n "$latest_tx_hash" ] && [ "$latest_tx_hash" != "$last_known_tx" ]; then
+            # If the latest tx is from the wallet and not an error, consider it an outgoing tx
+            if [ "$latest_tx_from" = "$addr_lower" ] && [ "${LATEST_TX_ISERROR:-1}" = "0" ]; then
+              changed=1
+              issue_title+="Outgoing tx detected for ${addr_lower}\n"
+              # Convert value to ETH for readability
+              tx_value_eth=$(echo "scale=18; ${LATEST_TX_VALUE:-0}/1000000000000000000" | bc -l)
+              issue_body+="Outgoing tx: https://etherscan.io/tx/${latest_tx_hash}\nFrom: ${latest_tx_from}\nTo: ${LATEST_TX_TO:-}\nValue: ${tx_value_eth} ETH\n"
+            fi
+          fi
+
+          if [ "$changed" -eq 1 ]; then
+            # Build a safe summary title and body
+            title=$(echo "$issue_title" | head -n 1 | tr -d '\\n' | cut -c1-120)
+            body="Repository: $repo\nAddress: ${addr_lower}\n\n${issue_body}\n\nChecks performed: ETH balance, LP token balance, optional ERC-20 token balance, recent txs.\nGenerated by GitHub Actions monitor.\n"
+
+            # Create GitHub issue
+            echo "Creating issue: $title"
+            payload=$(jq -n --arg t "$title" --arg b "$body" '{title:$t, body:$b, labels:["eth-watch"]}')
+            curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$repo/issues" -d "$payload" || true
+
+            # Update stored state files and commit
+            mkdir -p .github/eth-watch
+            echo "$current_eth_wei" > .github/eth-watch/last_eth_wei.txt
+            echo "$current_lp_raw" > .github/eth-watch/last_lp_raw.txt
+            echo "$current_token_raw" > .github/eth-watch/last_token_raw.txt
+            echo "$latest_tx_hash" > .github/eth-watch/last_tx_hash.txt
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/eth-watch/last_eth_wei.txt .github/eth-watch/last_lp_raw.txt .github/eth-watch/last_token_raw.txt .github/eth-watch/last_tx_hash.txt || true
+            if git commit -m "chore: update eth-watch last-known state for ${addr_lower}"; then
+              git push
+            else
+              echo "No changes to commit or push failed."
+            fi
+          else
+            echo "No relevant changes detected."
+          fi
+
+      - name: Optional: Slack alert (if SLACK_WEBHOOK secret exists)
+        if: ${{ secrets.SLACK_WEBHOOK != '' }}
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          WATCH_ADDRESS: ${{ secrets.WATCH_ADDRESS }}
+        run: |
+          # If an issue was created in previous step, post a short message to Slack
+          # We'll post whenever last_tx_hash changed or balances changed (based on stored files)
+          LAST_TX_FILE=.github/eth-watch/last_tx_hash.txt
+          LAST_TX=""
+          if [ -f "$LAST_TX_FILE" ]; then LAST_TX=$(cat "$LAST_TX_FILE"); fi
+
+          # Build a small message
+          msg="Wallet ${WATCH_ADDRESS} monitor ran. See repository notifications for details."
+
+          payload=$(jq -n --arg text "$msg" '{text:$text}')
+          curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK" || true
